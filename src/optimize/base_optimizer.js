@@ -1,28 +1,66 @@
-import { resolve } from 'path';
+/*
+ * Licensed to Elasticsearch B.V. under one or more contributor
+ * license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright
+ * ownership. Elasticsearch B.V. licenses this file to you under
+ * the Apache License, Version 2.0 (the "License"); you may
+ * not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 import { writeFile } from 'fs';
-
-import webpack from 'webpack';
+import os from 'os';
 import Boom from 'boom';
-import DirectoryNameAsMain from '@elastic/webpack-directory-name-as-main';
-import ExtractTextPlugin from 'extract-text-webpack-plugin';
-import CommonsChunkPlugin from 'webpack/lib/optimize/CommonsChunkPlugin';
-import DefinePlugin from 'webpack/lib/DefinePlugin';
-import UglifyJsPlugin from 'webpack/lib/optimize/UglifyJsPlugin';
-import { defaults, transform } from 'lodash';
+import MiniCssExtractPlugin from 'mini-css-extract-plugin';
+import TerserPlugin from 'terser-webpack-plugin';
+import webpack from 'webpack';
+import Stats from 'webpack/lib/Stats';
+import * as threadLoader from 'thread-loader';
+import webpackMerge from 'webpack-merge';
+import { DynamicDllPlugin } from './dynamic_dll_plugin';
 
-import { fromRoot } from '../utils';
-import babelOptions from './babel/options';
-import pkg from '../../package.json';
-import { setLoaderQueryParam, makeLoaderString } from './loaders';
+import { defaults } from 'lodash';
 
-const babelExclude = [/[\/\\](webpackShims|node_modules|bower_components)[\/\\]/];
+import { IS_KIBANA_DISTRIBUTABLE, fromRoot } from '../legacy/utils';
+
+import { PUBLIC_PATH_PLACEHOLDER } from './public_path_placeholder';
+
+const POSTCSS_CONFIG_PATH = require.resolve('./postcss.config');
+const BABEL_PRESET_PATH = require.resolve('@kbn/babel-preset/webpack_preset');
+const BABEL_EXCLUDE_RE = [
+  /[\/\\](webpackShims|node_modules|bower_components)[\/\\]/,
+];
+const STATS_WARNINGS_FILTER = new RegExp([
+  '(export .* was not found in)',
+  '|(chunk .* \\[mini-css-extract-plugin\\]\\\nConflicting order between:)'
+].join(''));
+
+function recursiveIssuer(m) {
+  if (m.issuer) {
+    return recursiveIssuer(m.issuer);
+  } else if (m.name) {
+    return m.name;
+  } else {
+    return false;
+  }
+}
 
 export default class BaseOptimizer {
   constructor(opts) {
-    this.env = opts.env;
-    this.urlBasePath = opts.urlBasePath;
-    this.bundles = opts.bundles;
+    this.logWithMetadata = opts.logWithMetadata || (() => null);
+    this.uiBundles = opts.uiBundles;
+    this.discoveredPlugins = opts.discoveredPlugins;
     this.profile = opts.profile || false;
+    this.workers = opts.workers;
 
     switch (opts.sourceMaps) {
       case true:
@@ -38,193 +76,461 @@ export default class BaseOptimizer {
         break;
     }
 
-    this.unsafeCache = opts.unsafeCache || false;
-    if (typeof this.unsafeCache === 'string') {
-      this.unsafeCache = [
-        new RegExp(this.unsafeCache.slice(1, -1))
-      ];
-    }
+    // Run some pre loading in order to prevent
+    // high delay when booting thread loader workers
+    this.warmupThreadLoaderPool();
   }
 
-  async initCompiler() {
-    if (this.compiler) return this.compiler;
+  async init() {
+    if (this.compiler) {
+      return this;
+    }
 
     const compilerConfig = this.getConfig();
     this.compiler = webpack(compilerConfig);
 
-    this.compiler.plugin('done', stats => {
-      if (!this.profile) return;
+    // register the webpack compiler hooks
+    // for the base optimizer
+    this.registerCompilerHooks();
 
-      const path = resolve(this.env.workingDir, 'stats.json');
+    return this;
+  }
+
+  registerCompilerHooks() {
+    this.registerCompilerDoneHook();
+  }
+
+  registerCompilerDoneHook() {
+    this.compiler.hooks.done.tap('base_optimizer-done', stats => {
+      // We are not done while we have an additional
+      // compilation pass to run
+      // We also don't need to emit the stats if we don't have
+      // the profile option set
+      if (!this.profile || stats.compilation.needAdditionalPass) {
+        return;
+      }
+
+      const path = this.uiBundles.resolvePath('stats.json');
       const content = JSON.stringify(stats.toJson());
       writeFile(path, content, function (err) {
         if (err) throw err;
       });
     });
+  }
 
-    return this.compiler;
+  warmupThreadLoaderPool() {
+    const baseModules = [
+      'babel-loader',
+      BABEL_PRESET_PATH
+    ];
+
+    threadLoader.warmup(
+      // pool options, like passed to loader options
+      // must match loader options to boot the correct pool
+      this.getThreadLoaderPoolConfig(),
+      [
+        // modules to load on the pool
+        ...baseModules,
+      ]
+    );
+  }
+
+  getThreadPoolCpuCount() {
+    if (this.workers) {
+      return this.workers;
+    }
+
+    const cpus = os.cpus();
+    if (!cpus) {
+      // sometimes this call returns undefined so we fall back to 1: https://github.com/nodejs/node/issues/19022
+      return 1;
+    }
+
+    return Math.max(
+      1,
+      Math.min(
+        cpus.length - 1,
+        7
+      )
+    );
+  }
+
+  getThreadLoaderPoolConfig() {
+    // Calculate the node options from the NODE_OPTIONS env var
+    const parsedNodeOptions = process.env.NODE_OPTIONS ? process.env.NODE_OPTIONS.split(/\s/) : [];
+
+    return {
+      name: 'optimizer-thread-loader-main-pool',
+      workers: this.getThreadPoolCpuCount(),
+      workerParallelJobs: 20,
+      // This is a safe check in order to set
+      // the parent node options applied from
+      // the NODE_OPTIONS env var for every launched worker.
+      // Otherwise, if the user sets max_old_space_size, as they
+      // are used to, into NODE_OPTIONS, it won't affect the workers.
+      workerNodeArgs: parsedNodeOptions,
+      poolParallelJobs: this.getThreadPoolCpuCount() * 20,
+      poolTimeout: this.uiBundles.isDevMode() ? Infinity : 2000
+    };
   }
 
   getConfig() {
-    const loaderWithSourceMaps = (loader) =>
-      setLoaderQueryParam(loader, 'sourceMap', !!this.sourceMaps);
-
-    const makeStyleLoader = preprocessor => {
-      let loaders = [
-        loaderWithSourceMaps('css-loader?autoprefixer=false'),
-        {
-          name: 'postcss-loader',
-          query: {
-            config: require.resolve('./postcss.config')
-          }
-        },
+    function getStyleLoaderExtractor() {
+      return [
+        MiniCssExtractPlugin.loader
       ];
+    }
 
-      if (preprocessor) {
-        loaders = [
-          ...loaders,
-          loaderWithSourceMaps(preprocessor)
-        ];
+    function getStyleLoaders(preProcessors = [], postProcessors = []) {
+      return [
+        ...postProcessors,
+        {
+          loader: 'css-loader',
+          options: {
+            // importLoaders needs to know the number of loaders that follow this one,
+            // so we add 1 (for the postcss-loader) to the length of the preProcessors
+            // array that we merge into this array
+            importLoaders: 1 + preProcessors.length,
+          },
+        },
+        {
+          loader: 'postcss-loader',
+          options: {
+            config: {
+              path: POSTCSS_CONFIG_PATH,
+            },
+          },
+        },
+        ...preProcessors,
+      ];
+    }
+
+    /**
+     * Adds a cache loader if we're running in dev mode. The reason we're not adding
+     * the cache-loader when running in production mode is that it creates cache
+     * files in optimize/.cache that are not necessary for distributable versions
+     * of Kibana and just make compressing and extracting it more difficult.
+     */
+    const maybeAddCacheLoader = (cacheName, loaders) => {
+      if (IS_KIBANA_DISTRIBUTABLE) {
+        return loaders;
       }
 
-      return ExtractTextPlugin.extract(makeLoaderString(loaders));
+      return [
+        {
+          loader: 'cache-loader',
+          options: {
+            cacheDirectory: this.uiBundles.getCacheDirectory(cacheName)
+          }
+        },
+        ...loaders
+      ];
     };
 
-    const config = {
+    /**
+     * Creates the selection rules for a loader that will only pass for
+     * source files that are eligible for automatic transpilation.
+     */
+    const createSourceFileResourceSelector = (test) => {
+      return [
+        {
+          test,
+          exclude: BABEL_EXCLUDE_RE.concat(this.uiBundles.getWebpackNoParseRules()),
+        },
+        {
+          test,
+          include: /[\/\\]node_modules[\/\\]x-pack[\/\\]/,
+          exclude: /[\/\\]node_modules[\/\\]x-pack[\/\\](.+?[\/\\])*node_modules[\/\\]/,
+        }
+      ];
+    };
+
+    const commonConfig = {
+      mode: 'development',
       node: { fs: 'empty' },
       context: fromRoot('.'),
-      entry: this.bundles.toWebpackEntries(),
+      cache: true,
+      entry: {
+        ...this.uiBundles.toWebpackEntries(),
+        ...this._getDiscoveredPluginEntryPoints(),
+        light_theme: [
+          require.resolve('../legacy/ui/public/styles/bootstrap_light.less'),
+        ],
+        dark_theme: [
+          require.resolve('../legacy/ui/public/styles/bootstrap_dark.less'),
+        ],
+      },
 
       devtool: this.sourceMaps,
       profile: this.profile || false,
 
       output: {
-        path: this.env.workingDir,
+        path: this.uiBundles.getWorkingDir(),
         filename: '[name].bundle.js',
         sourceMapFilename: '[file].map',
-        publicPath: `${this.urlBasePath || ''}/bundles/`,
-        devtoolModuleFilenameTemplate: '[absolute-resource-path]'
+        publicPath: PUBLIC_PATH_PLACEHOLDER,
+        devtoolModuleFilenameTemplate: '[absolute-resource-path]',
+
+        // When the entry point is loaded, assign it's exported `plugin`
+        // value to a key on the global `__kbnBundles__` object.
+        // NOTE: Only actually used by new platform plugins
+        library: ['__kbnBundles__', '[name]'],
+        libraryExport: 'plugin',
       },
 
-      recordsPath: resolve(this.env.workingDir, 'webpack.records'),
+      optimization: {
+        splitChunks: {
+          cacheGroups: {
+            commons: {
+              name: 'commons',
+              chunks: chunk => chunk.canBeInitial() && chunk.name !== 'light_theme' && chunk.name !== 'dark_theme',
+              minChunks: 2,
+              reuseExistingChunk: true
+            },
+            light_theme: {
+              name: 'light_theme',
+              test: m => m.constructor.name === 'CssModule' && recursiveIssuer(m) === 'light_theme',
+              chunks: 'all',
+              enforce: true
+            },
+            dark_theme: {
+              name: 'dark_theme',
+              test: m => m.constructor.name === 'CssModule' && recursiveIssuer(m) === 'dark_theme',
+              chunks: 'all',
+              enforce: true
+            }
+          }
+        },
+        noEmitOnErrors: true
+      },
 
       plugins: [
-        new webpack.ResolverPlugin([
-          new DirectoryNameAsMain()
-        ]),
-        new webpack.NoErrorsPlugin(),
-        new ExtractTextPlugin('[name].style.css', {
-          allChunks: true
+        new DynamicDllPlugin({
+          uiBundles: this.uiBundles,
+          threadLoaderPoolConfig: this.getThreadLoaderPoolConfig(),
+          logWithMetadata: this.logWithMetadata
         }),
-        new CommonsChunkPlugin({
-          name: 'commons',
-          filename: 'commons.bundle.js'
+
+        new MiniCssExtractPlugin({
+          filename: '[name].style.css',
         }),
-        ...this.pluginsForEnv(this.env.context.env)
+
+        // replace imports for `uiExports/*` modules with a synthetic module
+        // created by create_ui_exports_module.js
+        new webpack.NormalModuleReplacementPlugin(/^uiExports\//, (resource) => {
+          // the map of uiExport types to module ids
+          const extensions = this.uiBundles.getAppExtensions();
+
+          // everything following the first / in the request is
+          // treated as a type of appExtension
+          const type = resource.request.slice(resource.request.indexOf('/') + 1);
+
+          resource.request = [
+            // the "val-loader" is used to execute create_ui_exports_module
+            // and use its return value as the source for the module in the
+            // bundle. This allows us to bypass writing to the file system
+            require.resolve('val-loader'),
+            '!',
+            require.resolve('./create_ui_exports_module'),
+            '?',
+            // this JSON is parsed by create_ui_exports_module and determines
+            // what require() calls it will execute within the bundle
+            JSON.stringify({ type, modules: extensions[type] || [] })
+          ].join('');
+        }),
+
+        ...this.uiBundles.getWebpackPluginProviders()
+          .map(provider => provider(webpack)),
       ],
 
       module: {
-        loaders: [
-          { test: /\.less$/, loader: makeStyleLoader('less-loader') },
-          { test: /\.css$/, loader: makeStyleLoader() },
-          { test: /\.jade$/, loader: 'jade-loader' },
-          { test: /\.json$/, loader: 'json-loader' },
-          { test: /\.(html|tmpl)$/, loader: 'raw-loader' },
-          { test: /\.png$/, loader: 'url-loader' },
-          { test: /\.(woff|woff2|ttf|eot|svg|ico)(\?|$)/, loader: 'file-loader' },
-          { test: /[\/\\]src[\/\\](core_plugins|ui)[\/\\].+\.js$/, loader: loaderWithSourceMaps('rjs-repack-loader') },
+        rules: [
           {
-            test: /\.js$/,
-            exclude: babelExclude.concat(this.env.noParse),
-            loader: 'babel-loader',
-            query: babelOptions.webpack
+            test: /\.less$/,
+            use: [
+              ...getStyleLoaderExtractor(),
+              ...getStyleLoaders(['less-loader'], maybeAddCacheLoader('less', []))
+            ],
           },
+          {
+            test: /\.css$/,
+            use: [
+              ...getStyleLoaderExtractor(),
+              ...getStyleLoaders([], maybeAddCacheLoader('css', []))
+            ],
+          },
+          {
+            test: /\.(html|tmpl)$/,
+            loader: 'raw-loader'
+          },
+          {
+            test: /\.(woff|woff2|ttf|eot|svg|ico|png|jpg|gif|jpeg)(\?|$)/,
+            loader: 'url-loader',
+            options: {
+              limit: 8192
+            }
+          },
+          {
+            resource: createSourceFileResourceSelector(/\.(js|tsx?)$/),
+            use: maybeAddCacheLoader('babel', [
+              {
+                loader: 'thread-loader',
+                options: this.getThreadLoaderPoolConfig()
+              },
+              {
+                loader: 'babel-loader',
+                options: {
+                  babelrc: false,
+                  presets: [
+                    BABEL_PRESET_PATH,
+                  ],
+                },
+              }
+            ]),
+          },
+          ...this.uiBundles.getPostLoaders().map(loader => ({
+            enforce: 'post',
+            ...loader
+          })),
         ],
-        postLoaders: this.env.postLoaders || [],
-        noParse: this.env.noParse,
+        noParse: this.uiBundles.getWebpackNoParseRules(),
       },
 
       resolve: {
-        extensions: ['.js', '.json', ''],
-        postfixes: [''],
-        modulesDirectories: ['webpackShims', 'node_modules'],
-        fallback: [fromRoot('webpackShims'), fromRoot('node_modules')],
-        loaderPostfixes: ['-loader', ''],
-        root: fromRoot('.'),
-        alias: this.env.aliases,
-        unsafeCache: this.unsafeCache,
+        extensions: ['.js', '.ts', '.tsx', '.json'],
+        mainFields: ['browser', 'browserify', 'main'],
+        modules: [
+          'webpackShims',
+          fromRoot('webpackShims'),
+
+          'node_modules',
+          fromRoot('node_modules'),
+        ],
+        alias: {
+          ...this.uiBundles.getAliases(),
+          'dll/set_csp_nonce$': require.resolve('./dynamic_dll_plugin/public/set_csp_nonce')
+        }
       },
 
-      resolveLoader: {
-        alias: transform(pkg.dependencies, function (aliases, version, name) {
-          if (name.endsWith('-loader')) {
-            aliases[name] = require.resolve(name);
-          }
-        }, {})
+      performance: {
+        // NOTE: we are disabling this as those hints
+        // are more tailored for the final bundles result
+        // and not for the webpack compilations performance itself
+        hints: false
       }
     };
 
-    // In the test env we need to add react-addons (and a few other bits) for the
-    // enzyme tests to work.
+    // when running from the distributable define an environment variable we can use
+    // to exclude chunks of code, modules, etc.
+    const isDistributableConfig = {
+      plugins: [
+        new webpack.DefinePlugin({
+          'process.env': {
+            'IS_KIBANA_DISTRIBUTABLE': `"true"`
+          }
+        }),
+      ]
+    };
+
+    // We need to add react-addons (and a few other bits) for enzyme to work.
     // https://github.com/airbnb/enzyme/blob/master/docs/guides/webpack.md
-    if (this.env.context.env === 'development') {
-      config.externals = {
+    const supportEnzymeConfig = {
+      externals: {
+        'mocha': 'mocha',
         'react/lib/ExecutionEnvironment': true,
         'react/addons': true,
         'react/lib/ReactContext': true,
-      };
-    }
+      }
+    };
 
-    return config;
+    const watchingConfig = {
+      plugins: [
+        new webpack.WatchIgnorePlugin([
+          // When our bundle entry files are fresh they cause webpack
+          // to think they might have changed since the watcher was
+          // initialized, which triggers a second compilation on startup.
+          // Since we can't reliably update these files anyway, we can
+          // just ignore them in the watcher and prevent the extra compilation
+          /bundles[\/\\].+\.entry\.js/,
+        ])
+      ]
+    };
+
+    // in production we set the process.env.NODE_ENV and run
+    // the terser minimizer over our bundles
+    const productionConfig = {
+      mode: 'production',
+      optimization: {
+        minimizer: [
+          new TerserPlugin({
+            parallel: true,
+            sourceMap: false,
+            terserOptions: {
+              compress: false,
+              mangle: false
+            }
+          }),
+        ]
+      }
+    };
+
+    return webpackMerge(
+      commonConfig,
+      IS_KIBANA_DISTRIBUTABLE
+        ? isDistributableConfig
+        : {},
+      this.uiBundles.isDevMode()
+        ? webpackMerge(watchingConfig, supportEnzymeConfig)
+        : productionConfig
+    );
   }
 
-  pluginsForEnv(env) {
-    if (env !== 'production') {
-      return [];
+  isFailure(stats) {
+    if (stats.hasErrors()) {
+      return true;
     }
 
-    return [
-      new DefinePlugin({
-        'process.env': {
-          'NODE_ENV': '"production"'
-        }
-      }),
-      new UglifyJsPlugin({
-        compress: {
-          warnings: false
-        },
-        sourceMap: false,
-        mangle: false
-      }),
-    ];
+    const { warnings } = stats.toJson({ all: false, warnings: true });
+
+    // 1 - when typescript doesn't do a full type check, as we have the ts-loader
+    // configured here, it does not have enough information to determine
+    // whether an imported name is a type or not, so when the name is then
+    // exported, typescript has no choice but to emit the export. Fortunately,
+    // the extraneous export should not be harmful, so we just suppress these warnings
+    // https://github.com/TypeStrong/ts-loader#transpileonly-boolean-defaultfalse
+    //
+    // 2 - Mini Css Extract plugin tracks the order for each css import we have
+    // through the project (and it's successive imports) since version 0.4.2.
+    // In case we have the same imports more than one time with different
+    // sequences, this plugin will throw a warning. This should not be harmful,
+    // but the an issue was opened and can be followed on:
+    // https://github.com/webpack-contrib/mini-css-extract-plugin/issues/250#issuecomment-415345126
+    const filteredWarnings = Stats.filterWarnings(warnings, STATS_WARNINGS_FILTER);
+
+    return filteredWarnings.length > 0;
   }
 
   failedStatsToError(stats) {
-    const statFormatOpts = {
-      hash: false,  // add the hash of the compilation
-      version: false,  // add webpack version information
-      timings: false,  // add timing information
-      assets: false,  // add assets information
-      chunks: false,  // add chunk information
-      chunkModules: false,  // add built modules information to chunk information
-      modules: false,  // add built modules information
-      cached: false,  // add also information about cached (not built) modules
-      reasons: false,  // add information about the reasons why modules are included
-      source: false,  // add the source code of modules
-      errorDetails: false,  // add details to errors (like resolving log)
-      chunkOrigins: false,  // add the origins of chunks and chunk merging info
-      modulesSort: false,  // (string) sort the modules by that field
-      chunksSort: false,  // (string) sort the chunks by that field
-      assetsSort: false,  // (string) sort the assets by that field
-      children: false,
-    };
+    const details = stats.toString(defaults(
+      { colors: true, warningsFilter: STATS_WARNINGS_FILTER },
+      Stats.presetToOptions('minimal')
+    ));
 
-    const details = stats.toString(defaults({ colors: true }, statFormatOpts));
-
-    return Boom.create(
-      500,
+    return Boom.internal(
       `Optimizations failure.\n${details.split('\n').join('\n    ')}\n`,
-      stats.toJson(statFormatOpts)
+      stats.toJson(defaults({
+        warningsFilter: STATS_WARNINGS_FILTER,
+        ...Stats.presetToOptions('detailed')
+      }))
     );
+  }
+
+  _getDiscoveredPluginEntryPoints() {
+    // New platform plugin entry points
+    return [...this.discoveredPlugins.entries()]
+      .reduce((entryPoints, [pluginId, plugin]) => {
+        entryPoints[`plugin/${pluginId}`] = `${plugin.path}/public`;
+        return entryPoints;
+      }, {});
   }
 }

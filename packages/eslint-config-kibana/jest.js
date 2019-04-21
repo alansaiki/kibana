@@ -1,15 +1,22 @@
 module.exports = {
-  plugins: [
-    'jest',
-  ],
+  overrides: [
+    {
+      files: [
+        '**/*.{test,test.mocks,mock}.{js,ts,tsx}',
+      ],
+      plugins: [
+        'jest',
+      ],
 
-  env: {
-    'jest/globals': true,
-  },
+      env: {
+        'jest': true,
+      },
 
-  rules: {
-    'jest/no-disabled-tests': 'error',
-    'jest/no-focused-tests': 'error',
-    'jest/no-identical-title': 'error',
-  },
+      rules: {
+        'jest/no-focused-tests': 'error',
+        'jest/no-identical-title': 'error',
+        'import/order': 'off'
+      },
+    }
+  ]
 };
